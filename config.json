@@ -1,0 +1,33 @@
+{
+  "_comment": "Central configuration for the Capstone Retail Analytics Pipeline (ADLS Gen2 edition).",
+  "_instructions": "Fill in storage_account_name, container_name, and account_key before running.",
+  "adls": {
+    "storage_account_name": "storage-account-name",
+    "container_name": "container-name",
+    "account_key": "account-key"
+  },
+  "azure_sql": {
+    "server_name": "your-sql-server-name.database.windows.net",
+    "database_name": "your_database_name",
+    "username": "your_admin_user",
+    "password": "your_secure_password"
+  },
+  "pipeline": {
+    "run_date": "",
+    "generation_mode": "initial_seed",
+    "orchestration_mode": "initial_seed",
+    "dirty_data_ratio": 0.06,
+    "random_seed": 42,
+    "generate_mock_fx": true,
+    "publish_to_sql": false,
+    "save_to_catalog": true
+  },
+  "seed_sizes": {
+    "num_customers_seed": 1000,
+    "num_new_customers_incremental": 150,
+    "num_customers_to_update": 250,
+    "num_products": 1500,
+    "num_new_products_incremental": 500,
+    "num_orders": 2500
+  }
+}
