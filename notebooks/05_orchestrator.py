@@ -39,7 +39,7 @@ from datetime import datetime
 # Adjust the path to match your workspace layout.
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = "/Workspace/Users/praveenm191004@gmail.com/Capstone_Project/config.json"  # adjust to your workspace path
+_CONFIG_PATH = "path to your config.json file"  # adjust to your workspace path
 
 with open(_CONFIG_PATH, "r") as _f:
     _CFG = json.load(_f)
