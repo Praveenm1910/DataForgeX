@@ -48,12 +48,12 @@ for table_name in TABLES_TO_CATALOG:
            .saveAsTable(f"{DB_NAME}.{table_name}"))
         
         log_pipeline_event("catalog_sync", table_name, "SUCCESS", records_out=row_count)
-        print(f"✓ Successfully registered managed table: {DB_NAME}.{table_name} ({row_count} rows)")
+        print(f"[+] Successfully registered managed table: {DB_NAME}.{table_name} ({row_count} rows)")
         
     except Exception as e:
         log_pipeline_event("catalog_sync", table_name, "FAILED", error_message=str(e))
         failures.append((table_name, str(e)))
-        print(f"✗ Failed to register table {table_name}: {e}")
+        print(f"[-] Failed to register table {table_name}: {e}")
 
 # COMMAND ----------
 

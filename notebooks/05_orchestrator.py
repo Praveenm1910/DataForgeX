@@ -6,7 +6,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # 1. Load config & Runtime Arguments
 # ---------------------------------------------------------------------------
-_CONFIG_PATH = "/Workspace/Users/azuser7246_mml.local@karthikirisoutlook.onmicrosoft.com/Capstone_Project/config.json"  
+_CONFIG_PATH = "your path to config.json file"  
 
 with open(_CONFIG_PATH, "r") as _f:
     _CFG = json.load(_f)
@@ -85,12 +85,12 @@ def run_step(notebook_path: str, extra_params: dict = None, label: str = None) -
     }
     
     start = datetime.utcnow()
-    print(f"\n→ [{label}] starting at {start.strftime('%H:%M:%S')} UTC")
+    print(f"\n-> [{label}] starting at {start.strftime('%H:%M:%S')} UTC")
     
     try:
         result = dbutils.notebook.run(notebook_path, TIMEOUT, params)
         elapsed = round((datetime.utcnow() - start).total_seconds(), 1)
-        print(f"✓ [{label}] completed in {elapsed}s")
+        print(f"[+] [{label}] completed in {elapsed}s")
         _execution_log.append({"layer": label, "status": "SUCCESS", "duration": elapsed})
         return result or "OK"
         

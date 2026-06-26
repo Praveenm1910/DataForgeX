@@ -8,12 +8,9 @@ from pyspark.sql import types as T
 # ---------------------------------------------------------------------------
 # 1. Load config.json
 # ---------------------------------------------------------------------------
-# config.json must live in the same folder as the notebooks.
-# On Databricks, the working directory for %run notebooks is the repo/folder
-# root, so a relative path of just "config.json" resolves correctly.
 
 
-base_path="/Workspace/Users/azuser7246_mml.local@karthikirisoutlook.onmicrosoft.com/Capstone_Project/config.json"
+base_path="your path to config.json file"
 
 try:
     with open(base_path, "r") as f:
@@ -48,7 +45,6 @@ def override_config_from_adf(cfg_dict, section_name):
                 
                 print(f"[!] ADF Override -> {section_name}.{key}: {cfg_dict[section_name][key]}")
         except Exception as e:
-            # Safely ignore if we aren't running in a widget-supported environment
             pass
 
 # 3. Apply the overrides to both config sections
@@ -58,6 +54,8 @@ override_config_from_adf(_CFG, "seed_sizes")
 # Now re-assign your local variables so the rest of your script uses the ADF values
 _PIPELINE_CFG = _CFG["pipeline"]
 _SEED_CFG     = _CFG["seed_sizes"]
+
+
 # ---------------------------------------------------------------------------
 # 2. ADLS connection settings
 # ---------------------------------------------------------------------------
@@ -72,7 +70,6 @@ ADLS_OPTS = {
     f"fs.azure.account.key.{STORAGE_ACCOUNT}.dfs.core.windows.net": ACCOUNT_KEY,
 }
 
-# === THE CRITICAL FIX FOR SCD2 INCREMENTAL MERGES ===
 # Globally register ADLS credentials for DeltaTable APIs
 try:
     for key, value in ADLS_OPTS.items():
@@ -92,7 +89,6 @@ _PIPELINE_CFG    = _CFG["pipeline"]
 _SEED_CFG        = _CFG["seed_sizes"]
 
 # Helper to safely read Orchestrator parameters (which arrive as widgets) 
-# without crashing if the notebook is run manually.
 def get_runtime_arg(arg_name, default_val):
     try:
         val = dbutils.widgets.get(arg_name)
@@ -192,7 +188,6 @@ def table_exists(schema_name: str, table_name: str) -> bool:
     path = _table_path(schema_name, table_name)
     try:
         # .head() forces an immediate action over Spark Connect, ensuring 
-        # the exception is thrown here if the path does not exist.
         spark.read.format("delta").options(**ADLS_OPTS).load(path).head()
         return True
     except Exception:

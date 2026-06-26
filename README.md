@@ -51,21 +51,38 @@ Before running the pipeline, update the `config.json` file located in the projec
 
 ```json
 {
-  "adls": {
-    "storage_account_name": "<your-storage-account>",
-    "container_name": "<your-container>",
-    "account_key": "<your-secure-account-key>"
-  },
   "azure_sql": {
-    "server_name": "<your-sql-server-name>.database.windows.net",
-    "database_name": "<your-db>",
-    "username": "<your-user>",
-    "password": "<your-password>"
+    "server_name": "your-sql-server-name.database.windows.net",
+    "database_name": "your_database_name",
+    "username": "your_admin_user",
+    "password": "your_secure_password",
+    "tables_to_publish": [
+      "dim_customer",
+      "dim_product",
+      "dim_date",
+      "fact_sales",
+      "agg_daily_sales_by_store",
+      "agg_sales_by_category"
+    ]
   },
   "pipeline": {
-    "orchestration_mode": "initial_seed", 
+    "run_date": "",
+    "generation_mode": "initial_seed",
+    "orchestration_mode": "initial_seed",
+    "dirty_data_ratio": 0.06,
+    "random_seed": 42,
     "generate_mock_fx": true,
     "publish_to_sql": false,
-    "save_to_catalog": true
+    "save_to_catalog": true,
+    "run_test_cases": true,
+    "write_customers_to_sql": false
+  },
+  "seed_sizes": {
+    "num_customers_seed": 1000,
+    "num_new_customers_incremental": 150,
+    "num_customers_to_update": 250,
+    "num_products": 1500,
+    "num_new_products_incremental": 500,
+    "num_orders": 2500
   }
 }

@@ -42,10 +42,7 @@ print(f"Processing: {list(datasets_to_process.keys())}")
 # COMMAND ----------
 
 def flatten_complete(df):
-    """
-    Generic recursive flattener: explodes arrays, expands structs, repeats
-    until the DataFrame is fully tabular.
-    """
+
     current_schema = df.schema
     while True:
         struct_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, StructType)]
@@ -225,7 +222,7 @@ def upsert_scd2(df_incoming, schema_name: str, table_name: str, cfg: dict, run_i
     run_id        = run_id or PIPELINE_RUN_ID
     path          = _table_path(schema_name, table_name)  # abfss:// path
 
-    # --- NEW FIX: Deduplicate incoming batch to guarantee ONE row per business key ---
+
     window_dedupe = Window.partitionBy(business_key).orderBy(F.col(effective_col).desc())
     df_incoming = (
         df_incoming

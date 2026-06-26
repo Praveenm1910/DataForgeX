@@ -40,10 +40,7 @@ def pick_new_files(dataset: str):
     return [f for f in all_files if f.path not in already_done]
 
 def ingest_csv_dataset(dataset: str, cfg: dict, file_rows):
-    """
-    Reads one or more CSV files from ADLS.
-    ADLS_OPTS is injected into spark.read so authentication is per-operation.
-    """
+
     paths = [r.path for r in file_rows]
 
     df = (
@@ -53,17 +50,9 @@ def ingest_csv_dataset(dataset: str, cfg: dict, file_rows):
              .csv(paths)
     )
 
-    if cfg.get("bronze_schema"):
-        # Typed source (Customers — stands in for a JDBC pull): cast to native SQL types.
-        for col_name, target_type in cfg["bronze_schema"].items():
-            if col_name in df.columns:
-                if target_type == "timestamp":
-                    df = df.withColumn(col_name, F.to_timestamp(F.col(col_name)))
-                else:
-                    df = df.withColumn(col_name, F.col(col_name).cast(target_type))
-    else:
-        # CSV Bronze Note: every column typed as STRING for structural stability.
-        df = df.select([F.col(c).cast("string").alias(c) for c in df.columns])
+    
+    # CSV Bronze Note: every column typed as STRING for structural stability.
+    df = df.select([F.col(c).cast("string").alias(c) for c in df.columns])
 
     # Fixed: Named the column "_SourceFile" to match downstream expectations 
     # and swapped in the UC-compliant _metadata attribute.

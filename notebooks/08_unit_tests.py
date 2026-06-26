@@ -180,18 +180,6 @@ class TestBronzeCSVIngestion(unittest.TestCase):
             schema
         )
 
-    def test_bronze_schema_casting_integer(self):
-        cfg = {"bronze_schema": {"CustomerID": "int"}}
-        result = ingest_csv_dataset_logic(self.df, cfg)
-        field = [f for f in result.schema.fields if f.name == "CustomerID"][0]
-        self.assertEqual(field.dataType, IntegerType())
-
-    def test_bronze_schema_casting_timestamp(self):
-        cfg = {"bronze_schema": {"LastUpdated": "timestamp"}}
-        result = ingest_csv_dataset_logic(self.df, cfg)
-        field = [f for f in result.schema.fields if f.name == "LastUpdated"][0]
-        self.assertEqual(field.dataType, TimestampType())
-
     def test_all_columns_cast_to_string_when_no_bronze_schema(self):
         cfg = {}
         result = ingest_csv_dataset_logic(self.df, cfg)
@@ -262,7 +250,7 @@ class TestPickNewFiles(unittest.TestCase):
         result = pick_new_files(all_files, done)
         self.assertEqual(len(result), 1)
 
-print("✓ Bronze layer test classes defined")
+print("[+] Bronze layer test classes defined")
 
 
 # ── 4 · Silver Layer Tests ────────────────────────────────────────────────────
@@ -531,7 +519,7 @@ class TestPhoneScrubbing(unittest.TestCase):
         self.assertIsNone(res_dict[5], "Too short phone number should become None")
 
 
-print("✓ Silver layer test classes defined")
+print("[+] Silver layer test classes defined")
 
 
 # ── 5 · SCD Type 2 Tests ──────────────────────────────────────────────────────
@@ -700,7 +688,7 @@ class TestSCDType2(unittest.TestCase):
         current = result.filter("_SCD_IsCurrent = true").count()
         self.assertEqual(total, current)
 
-print("✓ SCD Type 2 test classes defined")
+print("[+] SCD Type 2 test classes defined")
 
 
 # ── 6 · Gold Layer Tests ──────────────────────────────────────────────────────
@@ -866,7 +854,7 @@ class TestGoldAggregates(unittest.TestCase):
         total_qty = self.fact_sales.agg(F.sum("Quantity").alias("TotalQty")).collect()[0]["TotalQty"]
         self.assertEqual(total_qty, 6)
 
-print("✓ Gold layer test classes defined")
+print("[+] Gold layer test classes defined")
 
 
 # ── 7 · Orchestrator Tests ────────────────────────────────────────────────────
@@ -937,7 +925,7 @@ class TestOrchestratorFailureHandling(unittest.TestCase):
         except RuntimeError as e:
             self.assertIn("./03_silver_layer", str(e))
 
-print("✓ Orchestrator test classes defined")
+print("[+] Orchestrator test classes defined")
 
 
 # ── 8 · SQL Publish & Catalog Sync Tests ──────────────────────────────────────
@@ -1015,7 +1003,7 @@ class TestCatalogSync(unittest.TestCase):
         save_args = write_mock.saveAsTable.call_args[0][0]
         self.assertEqual(save_args, f"{self.DB_NAME}.agg_daily_sales_by_store")
 
-print("✓ SQL Publish & Catalog Sync test classes defined")
+print("[+] SQL Publish & Catalog Sync test classes defined")
 
 
 # ── 9 · Test Runner ───────────────────────────────────────────────────────────
@@ -1070,14 +1058,14 @@ if result.errors:
 
 # Exit gracefully depending on the environment
 if result.wasSuccessful():
-    print("\n✅  ALL TESTS PASSED — pipeline is production-ready.")
+    print("\n[+]  ALL TESTS PASSED — pipeline is production-ready.")
     try:
         dbutils.notebook.exit("ALL_TESTS_PASSED")
     except NameError:
         import sys
         sys.exit(0)
 else:
-    print("\n❌  SOME TESTS FAILED — review output above before promoting to production.")
+    print("\n[-]  SOME TESTS FAILED — review output above before promoting to production.")
     try:
         dbutils.notebook.exit(f"TESTS_FAILED: {failed} failure(s), {errors} error(s)")
     except NameError:

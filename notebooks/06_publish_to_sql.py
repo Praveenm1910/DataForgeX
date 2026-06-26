@@ -43,7 +43,6 @@ for table_name in TABLES_TO_PUBLISH:
         
         # 2. Write to Azure SQL using JDBC
         # We use mode("overwrite") so the reporting layer always mirrors the Lakehouse exactly,
-        # avoiding duplicate records in the presentation layer.
         (df.write
            .format("jdbc")
            .option("url", JDBC_URL)
