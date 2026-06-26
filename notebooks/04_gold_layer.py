@@ -206,7 +206,6 @@ if should_build("fact_sales"):
         )
 
         # 2. Rank the joined rates to find the MOST RECENT rate prior to the order
-        # This brilliantly handles weekends (Saturday orders will match to Friday's rate!)
         window_fx = Window.partitionBy("o.OrderID").orderBy(F.col("fx.RateDate").desc())
 
         fact_sales = (

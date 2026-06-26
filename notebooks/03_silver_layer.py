@@ -100,15 +100,7 @@ def parse_and_flatten_json_bronze(bronze_df, rename_map: dict):
 # COMMAND ----------
 
 def evolve_schema_and_write(df, schema_name: str, table_name: str, mode: str = "append") -> str:
-    """
-    Diffs the incoming DataFrame schema against the existing External Delta table,
-    issues `ALTER TABLE delta.\`<path>\` ADD COLUMNS (...)` for any new columns,
-    then writes the data.
 
-    Authentication for the write goes through ADLS_OPTS inside write_delta_table().
-    The ALTER TABLE statement operates on the Delta log via the abfss:// path so
-    no Unity Catalog registration is needed.
-    """
     path = _table_path(schema_name, table_name)  # abfss:// path from 00_config_utils
 
     if not table_exists(schema_name, table_name):
@@ -146,27 +138,49 @@ def clean_and_cast(df, cfg: dict):
         if col_name not in df.columns:
             df = df.withColumn(col_name, F.lit(None).cast(target_type))
             continue
+        
+        # 1. UNIVERSAL PRE-SCRUBBER: Catch ALL forms of fake nulls (including <NA>)
+        c = F.trim(F.col(col_name))
+        bad_strings = ["n/a", "null", "none", "nan", "", "<na>", "na", "undefined", "unknown"]
+        c = F.when(F.lower(c).isin(bad_strings), F.lit(None).cast("string")).otherwise(c)
+
+        # 2. CASTING
         if col_name in cfg["date_columns"]:
-            df = df.withColumn(col_name, F.to_date(F.trim(F.col(col_name)), cfg["date_columns"][col_name]))
+            df = df.withColumn(col_name, F.to_date(c, cfg["date_columns"][col_name]))
         elif target_type == "timestamp":
-            df = df.withColumn(col_name, F.to_timestamp(F.trim(F.col(col_name))))
+            df = df.withColumn(col_name, F.to_timestamp(c))
         elif target_type.startswith("decimal") or target_type in ("int", "bigint", "double", "float"):
-            cleaned = F.regexp_replace(F.trim(F.col(col_name)), r"[^0-9.\-]", "")
-            cleaned = F.when(cleaned == "", None).otherwise(cleaned)
+            cleaned = F.regexp_replace(c, r"[^0-9.\-]", "")
+            cleaned = F.when(cleaned == "", F.lit(None).cast("string")).otherwise(cleaned)
             df = df.withColumn(col_name, cleaned.cast(target_type))
         else:
-            df = df.withColumn(col_name, F.trim(F.col(col_name)).cast(target_type))
+            df = df.withColumn(col_name, c.cast(target_type))
 
+    # 3. TEXT FORMATTING
     for col_name in cfg.get("uppercase_columns", []):
         if col_name in df.columns:
             df = df.withColumn(col_name, F.upper(F.trim(F.col(col_name))))
+            
     for col_name in cfg.get("titlecase_columns", []):
         if col_name in df.columns:
             df = df.withColumn(col_name, F.initcap(F.trim(F.col(col_name))))
 
-    reject_exprs   = [F.col(c).isNull() for c in cfg["not_null_columns"] if c in df.columns]
-    reject_exprs  += [F.expr(rule) for rule in cfg.get("dq_rules", [])]
+    # 4. PHONE NUMBER SCRUBBING
+    for col_name in cfg.get("phone_columns", []):
+        if col_name in df.columns:
+            c = F.col(col_name)
+            c = F.regexp_replace(c, r"[^\d]", "")
+            # Ensure we handle existing NULLs safely so F.length doesn't fail
+            c = F.when(c.isNull() | (F.length(c) < 10) | (F.length(c) > 15) | (c == ""), F.lit(None).cast("string")).otherwise(c)
+            df = df.withColumn(col_name, c)
 
+    # 5. STRICT GLOBAL NULL REJECTION (Using SQL Expr for perfect accuracy)
+    reject_conds = [f"`{c}` IS NULL" for c in cfg["silver_schema"].keys() if c in df.columns]
+    
+    # Append any custom math/logic rules
+    reject_conds.extend([f"({rule})" for rule in cfg.get("dq_rules", [])])
+
+    # 6. REFERENTIAL INTEGRITY
     aliases_to_drop = []
     for check in cfg.get("referential_checks", []):
         col_name, ref_schema, ref_table, ref_col = (
@@ -175,18 +189,21 @@ def clean_and_cast(df, cfg: dict):
         if col_name not in df.columns or not table_exists(ref_schema, ref_table):
             continue
         ref_alias = f"_ref_{col_name}"
-        # read_delta_table injects ADLS_OPTS
         ref_df    = (
             read_delta_table(ref_schema, ref_table)
             .select(F.col(ref_col).alias(ref_alias))
             .distinct()
         )
         df = df.join(ref_df, df[col_name] == ref_df[ref_alias], "left")
-        reject_exprs.append(F.col(col_name).isNotNull() & F.col(ref_alias).isNull())
+        reject_conds.append(f"`{col_name}` IS NOT NULL AND `{ref_alias}` IS NULL")
         aliases_to_drop.append(ref_alias)
 
-    is_rejected = reduce(lambda a, b: a | b, reject_exprs) if reject_exprs else F.lit(False)
-    df = df.withColumn("_IsRejected", F.coalesce(is_rejected, F.lit(True)))
+    # 7. APPLY REJECTION FLAG
+    if reject_conds:
+        reject_expr = F.expr(" OR ".join(reject_conds))
+        df = df.withColumn("_IsRejected", F.coalesce(reject_expr, F.lit(True)))
+    else:
+        df = df.withColumn("_IsRejected", F.lit(False))
 
     for alias in aliases_to_drop:
         df = df.drop(alias)
@@ -253,12 +270,7 @@ def upsert_scd2(df_incoming, schema_name: str, table_name: str, cfg: dict, run_i
     if not changed_keys:
         return path, 0, df_incoming.count()
 
-    # DeltaTable.forPath — uses the abfss:// path directly, no registered table name needed.
-    # Databricks Serverless resolves ADLS credentials via the cluster's storage account key
-    # already set in ADLS_OPTS; forPath does not need an extra option dict here because the
-    # Delta log access goes through the same Spark session that has the key in its conf via
-    # the prior write operations in this session.
-    # 1. Register the incoming new/changed rows as a temporary view
+  
     # 1. Register the incoming new/changed rows as a temporary view
     changed_or_new.createOrReplaceTempView("scd2_source")
 

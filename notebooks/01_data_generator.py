@@ -25,6 +25,7 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+
 import random
 import json
 import pandas as pd
@@ -38,6 +39,8 @@ from faker import Faker
 RUN_DATE         = _CFG["pipeline"].get("run_date", "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
 GENERATION_MODE  = _CFG["pipeline"].get("generation_mode", "initial_seed").strip()
 DIRTY_RATIO      = float(_CFG["pipeline"].get("dirty_data_ratio", 0.06))
+WRITE_CUSTOMERS_TO_SQL = _CFG["pipeline"].get("write_customers_to_sql", False) # <-- NEW TOGGLE
+
 _SEEDS           = _CFG["seed_sizes"]
 NUM_CUSTOMERS_SEED      = int(_SEEDS.get("num_customers_seed", 500))
 NUM_NEW_CUSTOMERS_INCR  = int(_SEEDS.get("num_new_customers_incremental", 15))
@@ -51,6 +54,7 @@ fake = Faker()
 
 RUN_TS = RUN_DATE.replace("-", "")  # YYYYMMDD — used in filenames
 print(f"run_date={RUN_DATE}  mode={GENERATION_MODE}  dirty_ratio={DIRTY_RATIO}")
+print(f"write_customers_to_sql={WRITE_CUSTOMERS_TO_SQL}")
 
 # ---------------------------------------------------------------------------
 # Reference data & helpers
@@ -66,31 +70,57 @@ CATEGORY_TREE = {
 BRANDS       = ["Zentra", "Northwind", "Bluepeak", "Veloria", "Crestline", "Pixelhive", "Marsh & Co", "Aurex"]
 STORE_CODES  = [f"ST{n:03d}" for n in range(1, 11)]
 
-
 def maybe(prob: float) -> bool:
     return random.random() < prob
 
+# ---------------------------------------------------------------------------
+# Azure SQL Helpers (For Dynamic Customer Routing)
+# ---------------------------------------------------------------------------
+
+def get_sql_options(table_name: str) -> dict:
+    sql_cfg = _CFG.get("azure_sql", {})
+    # Serverless requires explicit parameters instead of a single JDBC URL string
+    return {
+        "host": sql_cfg.get("server_name"),
+        "port": "1433",
+        "database": sql_cfg.get("database_name"),
+        "dbtable": table_name,
+        "user": sql_cfg.get("username"),
+        "password": sql_cfg.get("password"),
+        "encrypt": "true",
+        "trustservercertificate": "false",
+        "connectiontimeout": "60"
+    }
+
+def write_pandas_to_sql(pandas_df: pd.DataFrame, table_name: str, write_mode: str = "overwrite"):
+    print(f"  -> Writing {len(pandas_df)} rows to Azure SQL table: {table_name} (mode: {write_mode})...")
+    
+    # Force ALL columns to be raw strings (exactly like saving to a CSV file)
+    # This prevents Azure SQL from guessing data types and leaves casting to the Silver Layer
+    raw_string_df = pandas_df.astype(str).replace("None", "").replace("nan", "")
+    spark_df = spark.createDataFrame(raw_string_df)
+    
+    # CHANGED: "jdbc" -> "sqlserver" to support Databricks Serverless compute write restrictions
+    spark_df.write.format("sqlserver").options(**get_sql_options(table_name)).mode(write_mode).save()
+    print("  -> SQL write complete!")
+
+def read_sql_to_pandas(table_name: str) -> pd.DataFrame:
+    try:
+        # We cast to string so it behaves exactly like reading a raw CSV file
+        # CHANGED: "jdbc" -> "sqlserver"
+        return spark.read.format("sqlserver").options(**get_sql_options(table_name)).load().toPandas().astype("string")
+    except Exception as e:
+        print(f"  -> Could not read SQL table {table_name} (it may not exist yet).")
+        return pd.DataFrame()
+
 
 # ---------------------------------------------------------------------------
-# ADLS write helpers — Spark-based, no dbutils.fs
+# ADLS write/read helpers
 # ---------------------------------------------------------------------------
 
 def write_csv_to_raw(pandas_df: "pd.DataFrame", dataset: str, filename: str) -> str:
-    """
-    Converts a Pandas DataFrame to a Spark DataFrame and writes it as a single
-    CSV file to raw/<dataset>/<filename> on ADLS using coalesce(1).
-
-    Authentication is provided through ADLS_OPTS — dbutils.fs.put is never called.
-
-    The file is written as a single part file by coalescing to 1 partition.
-    The path written is raw/<dataset>/<filename> (Spark appends part-0000... internally;
-    the folder acts as the file container, which Bronze reads via spark.read.csv(<folder>)).
-    """
     target_path = f"{get_layer_path('raw', dataset)}/{filename}"
-
-    # Convert every column to string — mirrors the original CSV/over-the-wire behaviour
     csv_content = pandas_df.astype(str).replace("None", "").replace("nan", "")
-
     spark_df = spark.createDataFrame(csv_content)
     (
         spark_df
@@ -105,18 +135,9 @@ def write_csv_to_raw(pandas_df: "pd.DataFrame", dataset: str, filename: str) -> 
     print(f"  wrote {len(pandas_df):>6} rows -> {target_path}")
     return target_path
 
-
 def write_json_to_raw(payload: dict, dataset: str, filename: str) -> str:
-    """
-    Serialises a Python dict to a JSON string, wraps it in a single-row Spark
-    DataFrame (one column: `value`), and writes it as a text file to ADLS.
-
-    Using .format("text") preserves the raw JSON string exactly — Bronze reads
-    it back with spark.read.text(..., wholetext=True).
-    """
     target_path = f"{get_layer_path('raw', dataset)}/{filename}"
     json_str     = json.dumps(payload, indent=2, default=str)
-
     single_row_df = spark.createDataFrame([(json_str,)], ["value"])
     (
         single_row_df
@@ -131,39 +152,53 @@ def write_json_to_raw(payload: dict, dataset: str, filename: str) -> str:
     return target_path
 
 def read_existing_ids(dataset: str, id_column: str):
-    """
-    Reads every CSV currently in raw/<dataset> via Spark (ADLS_OPTS injected)
-    and returns the distinct id_column values so later runs can extend the same pool.
-    """
+    # DYNAMIC TOGGLE: If it's customers and the flag is True, read from Azure SQL!
+    if dataset == "customers" and WRITE_CUSTOMERS_TO_SQL:
+        try:
+            # CHANGED: "jdbc" -> "sqlserver"
+            df = spark.read.format("sqlserver").options(**get_sql_options("raw_customer")).load()
+            if id_column in df.columns:
+                return sorted({str(r[id_column]) for r in df.select(id_column).distinct().collect()}, key=lambda x: int(x))
+        except Exception:
+            return []
+        return []
+
+    # Otherwise, read from ADLS Data Lake
     path = get_layer_path("raw", dataset)
     if not list_raw_files(dataset):
         return []
     df = (
         spark.read
              .option("header", True)
-             .option("recursiveFileLookup", "true")  # <-- ADD THIS LINE
+             .option("recursiveFileLookup", "true")
              .options(**ADLS_OPTS)
              .csv(path)
     )
     if id_column not in df.columns:
         return []
     return sorted(
-        {r[id_column] for r in df.select(id_column).distinct().collect()},
+        {str(r[id_column]) for r in df.select(id_column).distinct().collect()},
         key=lambda x: int(x)
     )
-
 
 def read_existing_customers_pandas() -> "pd.DataFrame":
     empty = pd.DataFrame(
         columns=["CustomerID", "FirstName", "LastName", "Email", "Phone", "City", "State", "LastUpdated"]
     )
+    
+    # DYNAMIC TOGGLE
+    if WRITE_CUSTOMERS_TO_SQL:
+        df = read_sql_to_pandas("raw_customer")
+        return df if not df.empty else empty
+
+    # Otherwise, read ADLS
     if not list_raw_files("customers"):
         return empty
     path = get_layer_path("raw", "customers")
     sdf  = (
         spark.read
              .option("header", True)
-             .option("recursiveFileLookup", "true")  # <-- ADD THIS LINE
+             .option("recursiveFileLookup", "true")
              .options(**ADLS_OPTS)
              .csv(path)
     )
@@ -171,7 +206,7 @@ def read_existing_customers_pandas() -> "pd.DataFrame":
 
 
 # ---------------------------------------------------------------------------
-# Generators  (identical business logic to original; only writes changed above)
+# Generators (identical business logic to original)
 # ---------------------------------------------------------------------------
 
 def generate_products(num_products: int, dirty_ratio: float = DIRTY_RATIO, start_id: int = 1) -> pd.DataFrame:
@@ -190,7 +225,7 @@ def generate_products(num_products: int, dirty_ratio: float = DIRTY_RATIO, start
             brand = None
         cost_price_str = f"{cost_price:.2f}"
         if maybe(dirty_ratio * 0.5):
-            cost_price_str = f"${cost_price:.2f}"  # malformed currency — Silver strips it
+            cost_price_str = f"${cost_price:.2f}" 
 
         rows.append({
             "ProductID":   str(pid),
@@ -305,21 +340,17 @@ def generate_orders(num_orders: int, order_date: str, customer_id_pool: list,
     return pd.DataFrame(rows).astype("string")
 
 def generate_exchange_rates_payload(rate_date: str, base_currency: str = "USD") -> dict:
-    """
-    Generates synthetic exchange rates that perfectly mimic the Frankfurter API structure.
-    """
-    # A mix of decimals (DOUBLE) and whole numbers (BIGINT, like IDR) to test our Silver stack logic
     currencies = ["AUD", "BRL", "CAD", "CHF", "CNY", "EUR", "GBP", "IDR", "INR", "JPY", "MXN"]
     rates = {}
     
     for ccy in currencies:
         if maybe(0.05): 
-            continue # Randomly drop a currency to simulate real-world API volatility
+            continue
             
         if ccy == "IDR":
-            rates[ccy] = random.randint(15000, 18000) # Whole number
+            rates[ccy] = random.randint(15000, 18000)
         else:
-            rates[ccy] = round(random.uniform(0.5, 90), 4) # Decimal
+            rates[ccy] = round(random.uniform(0.5, 90), 4)
 
     return {
         "amount": 1.0,
@@ -327,7 +358,6 @@ def generate_exchange_rates_payload(rate_date: str, base_currency: str = "USD") 
         "date": rate_date,
         "rates": rates
     }
-
 
 # ---------------------------------------------------------------------------
 # Orchestration
@@ -341,14 +371,10 @@ if GENERATION_MODE == "initial_seed":
     products_df = generate_products(NUM_PRODUCTS)
     write_csv_to_raw(products_df, "products", f"products_{RUN_TS}.csv")
 else:
-    # 1. Determine how many new products to generate (defaults to 5 if not in config)
     num_new_prods = int(_SEEDS.get("num_new_products_incremental", 5))
-    
-    # 2. Get existing IDs to find the next available ProductID (e.g., if max is 150, start at 151)
     existing_product_ids = read_existing_ids("products", "ProductID")
     start_prod_id = max(int(x) for x in existing_product_ids) + 1 if existing_product_ids else 1
     
-    # 3. Read the existing products catalog into a Pandas DataFrame
     path = get_layer_path("raw", "products")
     existing_products_df = (
         spark.read.option("header", True)
@@ -357,33 +383,34 @@ else:
              .csv(path)
     ).toPandas()
     
-    # 4. Generate the brand new products
     new_products_df = generate_products(num_new_prods, start_id=start_prod_id)
-    
-    # 5. Append the new products to the bottom of the existing catalog
     full_catalog_df = pd.concat([existing_products_df, new_products_df], ignore_index=True)
     
-    # 6. Write the new Full Snapshot to ADLS
     ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     write_csv_to_raw(full_catalog_df, "products", f"products_full_snapshot_{ts_suffix}.csv")
 
-# Ensure the new products are available for the Orders generator to use!
 product_id_pool = read_existing_ids("products", "ProductID")
 if not product_id_pool:
     raise RuntimeError("No product pool available — run with generation_mode=initial_seed at least once.")
 
-# ---- Customers ----
+# ---- Customers (DYNAMIC TOGGLE APPLIED) ----
 print("\n[customers]")
 if GENERATION_MODE == "initial_seed":
     customers_df = generate_customers_full(NUM_CUSTOMERS_SEED)
-    write_csv_to_raw(customers_df, "customers", f"customers_full_{RUN_TS}.csv")
+    if WRITE_CUSTOMERS_TO_SQL:
+        write_pandas_to_sql(customers_df, "raw_customer", "overwrite")
+    else:
+        write_csv_to_raw(customers_df, "customers", f"customers_full_{RUN_TS}.csv")
 else:
     existing_customers = read_existing_customers_pandas()
     customers_df       = generate_customers_incremental(
         existing_customers, NUM_NEW_CUSTOMERS_INCR, NUM_CUSTOMERS_TO_UPDATE
     )
-    ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    write_csv_to_raw(customers_df, "customers", f"customers_incremental_{ts_suffix}.csv")
+    if WRITE_CUSTOMERS_TO_SQL:
+        write_pandas_to_sql(customers_df, "raw_customer", "append")
+    else:
+        ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        write_csv_to_raw(customers_df, "customers", f"customers_incremental_{ts_suffix}.csv")
 
 customer_id_pool = read_existing_ids("customers", "CustomerID")
 if not customer_id_pool:
@@ -403,16 +430,16 @@ write_csv_to_raw(orders_df, "orders", f"orders_{RUN_TS}.csv")
 print("\n[exchange_rates]")
 GENERATE_FX = _CFG["pipeline"].get("generate_mock_fx", False)
 
-# FIX: Removed the 'initial_seed' restriction. Now it runs purely based on the config toggle!
 if GENERATE_FX:
-    # Generate fake Frankfurter data for today's run_date
     fx_payload = generate_exchange_rates_payload(RUN_DATE)
     write_json_to_raw(fx_payload, "exchange_rates", f"fx_rates_{RUN_TS}.json")
 else:
     print("[skip] FX Generation disabled in config. Assuming ADF / API handles daily loads.")
 
-
 print("\n=== Done ===")
 for ds in ["orders", "products", "customers", "exchange_rates"]:
-    files = list_raw_files(ds)
-    print(f"{ds:>16}: {len(files)} file(s) in {get_layer_path('raw', ds)}")
+    if ds == "customers" and WRITE_CUSTOMERS_TO_SQL:
+        print(f"       customers: Sent to Azure SQL table 'raw_customer'!")
+    else:
+        files = list_raw_files(ds)
+        print(f"{ds:>16}: {len(files)} file(s) in {get_layer_path('raw', ds)}")

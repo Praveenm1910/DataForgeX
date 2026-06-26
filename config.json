@@ -10,7 +10,15 @@
     "server_name": "your-sql-server-name.database.windows.net",
     "database_name": "your_database_name",
     "username": "your_admin_user",
-    "password": "your_secure_password"
+    "password": "your_secure_password",
+    "tables_to_publish": [
+      "dim_customer",
+      "dim_product",
+      "dim_date",
+      "fact_sales",
+      "agg_daily_sales_by_store",
+      "agg_sales_by_category"
+    ]
   },
   "pipeline": {
     "run_date": "",
@@ -20,7 +28,9 @@
     "random_seed": 42,
     "generate_mock_fx": true,
     "publish_to_sql": false,
-    "save_to_catalog": true
+    "save_to_catalog": true,
+    "run_test_cases": true,
+    "write_customers_to_sql": false
   },
   "seed_sizes": {
     "num_customers_seed": 1000,

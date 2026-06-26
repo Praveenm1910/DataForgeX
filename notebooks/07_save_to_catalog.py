@@ -1,6 +1,5 @@
 # Databricks notebook source
 # MAGIC %sql
-# MAGIC create catalog if not exists capstone;
 # MAGIC use catalog capstone;
 
 # COMMAND ----------
@@ -22,14 +21,9 @@ print(f"✓ Ensured Databricks database '{DB_NAME}' exists.")
 
 # COMMAND ----------
 
-TABLES_TO_CATALOG = [
-    "dim_customer",
-    "dim_product",
-    "dim_date",
-    "fact_sales",
-    "agg_daily_sales_by_store",
-    "agg_sales_by_category"
-]
+TABLES_TO_CATALOG = _CFG.get("azure_sql", {}).get("tables_to_publish", [])
+print(TABLES_TO_CATALOG)
+
 
 # COMMAND ----------
 

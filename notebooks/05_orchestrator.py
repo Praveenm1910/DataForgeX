@@ -1,58 +1,54 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # 05 · Pipeline Orchestrator  (ADLS Gen2 Edition)
-# MAGIC **Enterprise Retail Analytics Platform on Azure**
-# MAGIC
-# MAGIC Single-notebook entry point that chains all four layers end-to-end using
-# MAGIC `dbutils.notebook.run()`.
-# MAGIC
-# MAGIC **No `dbutils.widgets`** — all execution parameters are read from `config.json`
-# MAGIC (via the same `_CFG` object populated by `00_config_utils`).
-# MAGIC
-# MAGIC %md
-# MAGIC | Step | Notebook             | What it does |
-# MAGIC |------|----------------------|--------------|
-# MAGIC | 0    | `00_config_utils`    | Loaded by each child notebook via `%run` |
-# MAGIC | 1    | `01_data_generator`  | Generates raw CSV/JSON files for the run date |
-# MAGIC | 2    | `02_bronze_layer`    | Lands raw files into External Delta Bronze tables |
-# MAGIC | 3    | `03_silver_layer`    | Cleans, casts, validates, SCD2 → External Delta Silver |
-# MAGIC | 4    | `04_gold_layer`      | Builds star schema + aggregates in External Delta Gold |
-# MAGIC | 5    | `05_orchestrator`    | Master entry point that chains and executes the pipeline end-to-end |
-# MAGIC | 6    | `06_publish_to_sql`  | Exports Gold presentation tables to Azure SQL via JDBC for reporting |
-# MAGIC | 7    | `07_save_to_catalog` | Registers Gold Delta tables into Databricks Catalog (`capstone_gold_check`) |
-# MAGIC | 8    | `08_test_cases`      | Executes data quality validations and unit tests against pipeline outputs |
-# MAGIC
-# MAGIC ### Orchestration modes  (set `orchestration_mode` in config.json)
-# MAGIC * **`initial_seed`** — generates the first full dataset snapshot, then runs Bronze→Gold.
-# MAGIC * **`daily_incremental`** — generates only the day's delta files, then runs Bronze→Gold.
-# MAGIC * **`bronze_to_gold_only`** — skips `01_data_generator` entirely (ADF / real source lands files).
-
-# COMMAND ----------
-
 import json
 import uuid
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# Load config.json directly (this notebook does not %run 00_config_utils
-# because it does not need Spark or ADLS — it only drives dbutils.notebook.run).
-# Adjust the path to match your workspace layout.
+# 1. Load config & Runtime Arguments
 # ---------------------------------------------------------------------------
-
-_CONFIG_PATH = "path to your config.json file"  # adjust to your workspace path
+_CONFIG_PATH = "/Workspace/Users/azuser7246_mml.local@karthikirisoutlook.onmicrosoft.com/Capstone_Project/config.json"  
 
 with open(_CONFIG_PATH, "r") as _f:
     _CFG = json.load(_f)
 
-_PIPELINE_CFG      = _CFG["pipeline"]
-_SEED_CFG          = _CFG["seed_sizes"]
+# --- ADF OVERRIDE LOGIC ---
+def parse_bool(val):
+    return str(val).lower() in ("true", "1", "yes")
+
+def override_config_from_adf(cfg_dict, section_name):
+    for key, default_val in cfg_dict[section_name].items():
+        try:
+            dbutils.widgets.text(key, "")
+            adf_val = dbutils.widgets.get(key).strip()
+            if adf_val:
+                if isinstance(default_val, bool):
+                    cfg_dict[section_name][key] = parse_bool(adf_val)
+                elif isinstance(default_val, int):
+                    cfg_dict[section_name][key] = int(adf_val)
+                elif isinstance(default_val, float):
+                    cfg_dict[section_name][key] = float(adf_val)
+                else:
+                    cfg_dict[section_name][key] = adf_val
+        except Exception:
+            pass
+
+# Apply ADF Overrides before doing anything else
+override_config_from_adf(_CFG, "pipeline")
+override_config_from_adf(_CFG, "seed_sizes")
+
+_PIPELINE_CFG = _CFG["pipeline"]
+_SEED_CFG     = _CFG["seed_sizes"]
+
+# Get the pipeline run ID from ADF, or generate a fake one
+try:
+    dbutils.widgets.text("pipeline_run_id", "")
+    PIPELINE_RUN_ID = dbutils.widgets.get("pipeline_run_id").strip() or str(uuid.uuid4())
+except Exception:
+    PIPELINE_RUN_ID = str(uuid.uuid4())
 
 ORCHESTRATION_MODE = _PIPELINE_CFG.get("orchestration_mode", "daily_incremental").strip()
 RUN_DATE           = _PIPELINE_CFG.get("run_date", "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
-DIRTY_RATIO        = str(_PIPELINE_CFG.get("dirty_data_ratio", 0.06))
-PIPELINE_RUN_ID    = str(uuid.uuid4())
 
-# Per-notebook timeout in seconds — increase for very large seed runs.
 TIMEOUT = 3600
 
 print(f"=== Orchestrator starting ===")
@@ -61,136 +57,96 @@ print(f"run_date        : {RUN_DATE}")
 print(f"pipeline_run_id : {PIPELINE_RUN_ID}")
 print(f"timeout/nb      : {TIMEOUT}s")
 
-# COMMAND ----------
+# ---------------------------------------------------------------------------
+# 2. Execution Tracker & Child Notebook Forwarding
+# ---------------------------------------------------------------------------
+_execution_log = []
 
-# MAGIC %md ## Helper: run a child notebook
+def print_summary():
+    print("\n" + "="*50)
+    print(" PIPELINE EXECUTION SUMMARY")
+    print("="*50)
+    for step in _execution_log:
+        status_icon = "[+]" if step['status'] == "SUCCESS" else ("[->]" if step['status'] == "SKIPPED" else "[!]")
+        print(f"{status_icon} {step['layer'].ljust(20)} | {step['status'].ljust(8)} | {step['duration']}s")
+    print("="*50 + "\n")
 
-# COMMAND ----------
+# Prepare the forwarded parameters for child notebooks (must be strings)
+FORWARDED_PARAMS = {k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in _PIPELINE_CFG.items()}
+FORWARDED_PARAMS["pipeline_run_id"] = PIPELINE_RUN_ID
 
 def run_step(notebook_path: str, extra_params: dict = None, label: str = None) -> str:
-    """
-    Wraps `dbutils.notebook.run()` with timing and error propagation.
-    Child notebooks receive the pipeline_run_id and run_date so all layers
-    share the same lineage identifier.
-
-    Note: child notebooks read their own `config.json` via `00_config_utils`,
-    so only cross-cutting parameters need to be forwarded here.
-    """
     label  = label or notebook_path.split("/")[-1]
+    
+    # Merge the forwarded ADF parameters with any step-specific parameters
     params = {
-        "pipeline_run_id": PIPELINE_RUN_ID,
-        "run_date":        RUN_DATE,
+        **FORWARDED_PARAMS,
         **(extra_params or {}),
     }
+    
     start = datetime.utcnow()
     print(f"\n→ [{label}] starting at {start.strftime('%H:%M:%S')} UTC")
+    
     try:
-        result  = dbutils.notebook.run(notebook_path, TIMEOUT, params)
-        elapsed = (datetime.utcnow() - start).total_seconds()
-        print(f"✓ [{label}] completed in {elapsed:.1f}s  result={result!r}")
+        result = dbutils.notebook.run(notebook_path, TIMEOUT, params)
+        elapsed = round((datetime.utcnow() - start).total_seconds(), 1)
+        print(f"✓ [{label}] completed in {elapsed}s")
+        _execution_log.append({"layer": label, "status": "SUCCESS", "duration": elapsed})
         return result or "OK"
+        
     except Exception as e:
-        elapsed = (datetime.utcnow() - start).total_seconds()
-        print(f"✗ [{label}] FAILED after {elapsed:.1f}s")
-        raise RuntimeError(f"[{label}] failed: {e}") from e
+        elapsed = round((datetime.utcnow() - start).total_seconds(), 1)
+        _execution_log.append({"layer": label, "status": "FAILED", "duration": elapsed})
+        print_summary()
+        error_msg = f"PIPELINE HALTED AT: {label}. Check notebook run logs. Error: {str(e)}"
+        print(f"[!] {error_msg}")
+        raise Exception(error_msg)
 
-# COMMAND ----------
+def skip_step(label: str, reason: str):
+    print(f"\n[->] [{label}] skipped ({reason})")
+    _execution_log.append({"layer": label, "status": "SKIPPED", "duration": 0.0})
 
-# MAGIC %md ## Step 1 — Data Generator  (skipped in `bronze_to_gold_only` mode)
+# ---------------------------------------------------------------------------
+# 3. Pipeline Execution Steps
+# ---------------------------------------------------------------------------
 
-# COMMAND ----------
-
+# Step 1 - Data Generator
 if ORCHESTRATION_MODE in ("initial_seed", "daily_incremental"):
     gen_mode = "initial_seed" if ORCHESTRATION_MODE == "initial_seed" else "daily_incremental"
-    run_step(
-        "./01_data_generator",
-        extra_params={
-            # The generator reads most settings from config.json itself,
-            # but generation_mode needs to be explicit so the orchestrator can
-            # override it without editing config.json on every run.
-            "generation_mode": gen_mode,
-        },
-        label="01_data_generator",
-    )
+    run_step("./01_data_generator", extra_params={"generation_mode": gen_mode}, label="01_data_generator")
 else:
-    print(f"\n→ [01_data_generator] skipped (mode={ORCHESTRATION_MODE})")
+    skip_step("01_data_generator", f"mode={ORCHESTRATION_MODE}")
 
-# COMMAND ----------
+# Step 2 - Bronze
+run_step("./02_bronze_layer", label="02_bronze_layer")
 
-# MAGIC %md ## Step 2 — Bronze
+# Step 3 - Silver
+run_step("./03_silver_layer", label="03_silver_layer")
 
-# COMMAND ----------
+# Step 4 - Gold
+run_step("./04_gold_layer", label="04_gold_layer")
 
-run_step(
-    "./02_bronze_layer",
-    label="02_bronze_layer",
-)
-
-# COMMAND ----------
-
-# MAGIC %md ## Step 3 — Silver
-
-# COMMAND ----------
-
-run_step(
-    "./03_silver_layer",
-    label="03_silver_layer",
-)
-
-# COMMAND ----------
-
-# MAGIC %md ## Step 4 — Gold
-
-# COMMAND ----------
-
-run_step(
-    "./04_gold_layer",
-    label="04_gold_layer",
-)
-
-# COMMAND ----------
-
-# MAGIC %md ## Step 5 - Publish to Azure SQL
-
-# COMMAND ----------
-
-# Check the config toggle before attempting to run the SQL export
-PUBLISH_TO_SQL = _PIPELINE_CFG.get("publish_to_sql", False)
-
-if PUBLISH_TO_SQL:
-    run_step(
-        "./06_publish_to_sql",
-        label="06_publish_to_sql",
-    )
+# Step 5 - Publish to Azure SQL
+if _PIPELINE_CFG.get("publish_to_sql", False):
+    run_step("./06_publish_to_sql", label="06_publish_to_sql")
 else:
-    print("\n→ [06_publish_to_sql] skipped (publish_to_sql is false in config)")
+    skip_step("06_publish_to_sql", "publish_to_sql is false")
 
-# COMMAND ----------
-
-# MAGIC %md ## Step 6 - Publish to Databricks
-
-# COMMAND ----------
-
-# Check the config toggle before attempting to run the Catalog Sync
-SAVE_TO_CATALOG = _PIPELINE_CFG.get("save_to_catalog", False)
-
-if SAVE_TO_CATALOG:
-    run_step(
-        "./07_save_to_catalog",
-        label="07_save_to_catalog",
-    )
+# Step 6 - Publish to Databricks Catalog
+if _PIPELINE_CFG.get("save_to_catalog", False):
+    run_step("./07_save_to_catalog", label="07_save_to_catalog")
 else:
-    print("\n→ [07_save_to_catalog] skipped (save_to_catalog is false in config)")
+    skip_step("07_save_to_catalog", "save_to_catalog is false")
 
-# COMMAND ----------
+# Step 7 - Unit Tests
+if _PIPELINE_CFG.get("run_test_cases", False):
+    run_step("./08_unit_tests", label="08_unit_tests")
+else:
+    skip_step("08_unit_tests", "run_test_cases is false")
 
-# MAGIC %md ## Done
-
-# COMMAND ----------
-
-summary = (
-    f"Pipeline complete | run_date={RUN_DATE} | mode={ORCHESTRATION_MODE} "
-    f"| pipeline_run_id={PIPELINE_RUN_ID}"
-)
-print(f"\n=== {summary} ===")
+# ---------------------------------------------------------------------------
+# 4. Final Output
+# ---------------------------------------------------------------------------
+print_summary()
+summary = f"Pipeline complete | run_date={RUN_DATE} | mode={ORCHESTRATION_MODE} | pipeline_run_id={PIPELINE_RUN_ID}"
 dbutils.notebook.exit(summary)

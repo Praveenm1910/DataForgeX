@@ -1,19 +1,4 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # Capstone Config & Utilities (ADLS Gen2 Edition)
-# MAGIC **Enterprise Retail Analytics Platform on Azure**
-# MAGIC
-# MAGIC Reads all configuration from `config.json` (no `dbutils.widgets`).
-# MAGIC Every Delta table is written as an **External Delta table** directly to an `abfss://` path.
-# MAGIC Unity Catalog and `dbutils.fs` are not used anywhere in this file.
-# MAGIC
-# MAGIC Import from any other notebook with:
-# MAGIC ```
-# MAGIC %run ./00_config_utils
-# MAGIC ```
-
-# COMMAND ----------
-
 import json
 import uuid
 from datetime import datetime, timezone
@@ -26,13 +11,53 @@ from pyspark.sql import types as T
 # config.json must live in the same folder as the notebooks.
 # On Databricks, the working directory for %run notebooks is the repo/folder
 # root, so a relative path of just "config.json" resolves correctly.
-# If you placed it elsewhere, change the path below.
 
-_CONFIG_PATH = "path to your config.json file"  # adjust to your workspace path
 
-with open(_CONFIG_PATH, "r") as _f:
-    _CFG = json.load(_f)
+base_path="/Workspace/Users/azuser7246_mml.local@karthikirisoutlook.onmicrosoft.com/Capstone_Project/config.json"
 
+try:
+    with open(base_path, "r") as f:
+        _CFG = json.load(f)
+except FileNotFoundError:
+    raise FileNotFoundError("Could not find 'config.json'. Make sure it is uploaded to the same Workspace/Repo directory as this notebook.")
+# ---------------------------------
+
+# 2. Helper to safely convert ADF string widgets to correct Python types
+def parse_bool(val):
+    return str(val).lower() in ("true", "1", "yes")
+
+def override_config_from_adf(cfg_dict, section_name):
+    for key, default_val in cfg_dict[section_name].items():
+        try:
+            # Initialize the widget so the notebook knows it exists
+            dbutils.widgets.text(key, "")
+            
+            # Fetch the value from ADF
+            adf_val = dbutils.widgets.get(key).strip()
+            
+            # If ADF provided a value, overwrite the JSON default and cast the type
+            if adf_val:
+                if isinstance(default_val, bool):
+                    cfg_dict[section_name][key] = parse_bool(adf_val)
+                elif isinstance(default_val, int):
+                    cfg_dict[section_name][key] = int(adf_val)
+                elif isinstance(default_val, float):
+                    cfg_dict[section_name][key] = float(adf_val)
+                else:
+                    cfg_dict[section_name][key] = adf_val
+                
+                print(f"[!] ADF Override -> {section_name}.{key}: {cfg_dict[section_name][key]}")
+        except Exception as e:
+            # Safely ignore if we aren't running in a widget-supported environment
+            pass
+
+# 3. Apply the overrides to both config sections
+override_config_from_adf(_CFG, "pipeline")
+override_config_from_adf(_CFG, "seed_sizes")
+
+# Now re-assign your local variables so the rest of your script uses the ADF values
+_PIPELINE_CFG = _CFG["pipeline"]
+_SEED_CFG     = _CFG["seed_sizes"]
 # ---------------------------------------------------------------------------
 # 2. ADLS connection settings
 # ---------------------------------------------------------------------------
@@ -95,10 +120,7 @@ print(f"Pipeline Run Id  : {PIPELINE_RUN_ID}")
 # ---------------------------------------------------------------------------
 
 def get_layer_path(layer: str, dataset: str = None) -> str:
-    """
-    Returns the abfss:// path for a given layer (raw / bronze / silver / gold / audit),
-    optionally scoped to one dataset folder.
-    """
+
     path = f"{BASE_DATA_PATH}/{layer}"
     if dataset:
         path = f"{path}/{dataset}"
@@ -138,11 +160,7 @@ def _table_path(schema_name: str, table_name: str) -> str:
 
 def write_delta_table(df, schema_name: str, table_name: str, mode: str = "append",
                        partition_by=None, merge_schema: bool = True) -> str:
-    """
-    Writes a DataFrame as an External Delta table directly to ADLS.
-    Authentication is injected per-operation via ADLS_OPTS — no global spark.conf.set().
-    Returns the abfss:// path written to.
-    """
+
     path = _table_path(schema_name, table_name)
     writer = (
         df.write
@@ -170,11 +188,7 @@ def read_delta_table(schema_name: str, table_name: str):
 
 
 def table_exists(schema_name: str, table_name: str) -> bool:
-    """
-    Checks whether an External Delta table exists at the expected abfss:// path
-    by attempting to read its _delta_log. Returns False if the path is absent or
-    the folder contains no Delta log.
-    """
+
     path = _table_path(schema_name, table_name)
     try:
         # .head() forces an immediate action over Spark Connect, ensuring 
@@ -189,15 +203,7 @@ def table_exists(schema_name: str, table_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def list_raw_files(dataset: str):
-    """
-    Returns a list of lightweight namedtuple-like Row objects for every file
-    currently in raw/<dataset> on ADLS, ignoring Spark marker files (_*).
 
-    Uses spark.read.format("binaryFile") so authentication flows through
-    ADLS_OPTS — dbutils.fs.ls is never called.
-
-    Each returned Row has: .path  .name  .size  .modificationTime
-    """
     path = get_layer_path("raw", dataset)
     try:
         files_df = (
@@ -269,10 +275,7 @@ def get_already_ingested_files(dataset: str) -> set:
 
 
 def register_ingested_files(dataset: str, file_rows, run_id: str = None) -> None:
-    """
-    file_rows — list of Row objects returned by list_raw_files()
-    (fields: path, name, size, modificationTime).
-    """
+
     if not file_rows:
         return
     run_id = run_id or PIPELINE_RUN_ID
@@ -292,10 +295,7 @@ def register_ingested_files(dataset: str, file_rows, run_id: str = None) -> None
 
 
 def get_silver_watermark(dataset: str):
-    """
-    Retrieves the latest watermark for a given dataset.
-    Updated to look for the 'watermark' column instead of 'last_processed_ts'.
-    """
+
     path = _table_path("audit", "silver_watermark")
     
     if not table_exists("audit", "silver_watermark"):
@@ -319,10 +319,7 @@ def get_silver_watermark(dataset: str):
 
 
 def set_silver_watermark(dataset: str, watermark_val):
-    """
-    Updates the watermark table without using raw spark.sql() 
-    to bypass Databricks CE security restrictions on external storage.
-    """
+
     path = _table_path("audit", "silver_watermark")
     
     # 1. Create a DataFrame for the single new row
@@ -352,6 +349,8 @@ def set_silver_watermark(dataset: str, watermark_val):
                  .mode("overwrite")
                  .option("overwriteSchema", "true")
                  .save(path))
+        
+        
 # ---------------------------------------------------------------------------
 # 9. Dataset registry  (unchanged business logic, referential_checks use paths)
 # ---------------------------------------------------------------------------
@@ -408,6 +407,7 @@ DATASET_REGISTRY = {
         "referential_checks": [],
         "date_columns": {},
         "uppercase_columns": ["State"],
+        "phone_columns": ["Phone"],
         "silver_schema": {
             "CustomerID":  "int",
             "FirstName":   "string",
@@ -456,6 +456,8 @@ DATASET_REGISTRY = {
             "Quantity IS NOT NULL AND Quantity <= 0",
             "UnitPrice IS NOT NULL AND UnitPrice <= 0",
         ],
+        # THIS IS THE MAGIC THAT FIXES POWER BI:
+        # It checks the Silver tables. If the ID doesn't match, it rejects the order!
         "referential_checks": [
             {"column": "CustomerID", "ref_schema": "silver", "ref_table": "customers", "ref_column": "CustomerID"},
             {"column": "ProductID",  "ref_schema": "silver", "ref_table": "products",  "ref_column": "ProductID"},

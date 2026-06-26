@@ -493,6 +493,43 @@ class TestRejectionRules(unittest.TestCase):
         )
         result = apply_rejection_rules(all_valid, not_null_columns=["OrderID", "ProductID"])
         self.assertIn("_IsRejected", result.columns)
+def apply_phone_scrubbing(df, cfg):
+    for col_name in cfg.get("phone_columns", []):
+        if col_name in df.columns:
+            c = F.col(col_name)
+            c = F.when(F.lower(F.trim(c)).isin("n/a", "null", "none", ""), F.lit(None).cast("string")).otherwise(c)
+            c = F.regexp_replace(c, r"[^\d]", "")
+            c = F.when((F.length(c) < 10) | (F.length(c) > 15) | (c == ""), F.lit(None).cast("string")).otherwise(c)
+            df = df.withColumn(col_name, c)
+    return df
+
+class TestPhoneScrubbing(unittest.TestCase):
+    def setUp(self):
+        schema = StructType([
+            StructField("CustomerID", IntegerType(), True),
+            StructField("Phone", StringType(), True)
+        ])
+        self.df = spark.createDataFrame([
+            (1, "N/A"),
+            (2, "3268542351"),
+            (3, "(547)452-5534x1928"),
+            (4, "403.491.1718"),
+            (5, "123") # Too short, should become NULL
+        ], schema)
+
+    def test_phone_scrubbing_valid_and_invalid(self):
+        cfg = {"phone_columns": ["Phone"]}
+        result = apply_phone_scrubbing(self.df, cfg).collect()
+        
+        # Map results for easy assertion
+        res_dict = {r.CustomerID: r.Phone for r in result}
+        
+        self.assertIsNone(res_dict[1], "N/A should become None")
+        self.assertEqual(res_dict[2], "3268542351", "Valid 10-digit should remain")
+        self.assertEqual(res_dict[3], "54745255341928", "Symbols and extensions should be stripped")
+        self.assertEqual(res_dict[4], "4034911718", "Dots should be stripped")
+        self.assertIsNone(res_dict[5], "Too short phone number should become None")
+
 
 print("✓ Silver layer test classes defined")
 
@@ -989,6 +1026,7 @@ def build_test_suite():
     test_classes = [
         TestBronzeAuditColumns, TestBronzeCSVIngestion, TestBronzeJSONIngestion, TestPickNewFiles,
         TestFlattenComplete, TestParseAndFlattenJSONBronze, TestSchemaEvolution, TestRejectionRules,
+        TestPhoneScrubbing,
         TestSCDType2,
         TestGoldDimCustomer, TestGoldDimProduct, TestGoldFactSales, TestGoldAggregates,
         TestOrchestratorRunStep, TestOrchestratorFailureHandling,

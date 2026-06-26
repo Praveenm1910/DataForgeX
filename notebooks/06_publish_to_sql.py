@@ -3,8 +3,6 @@
 
 # COMMAND ----------
 
-# COMMAND ----------
-
 # Attempt to load SQL credentials from the config. 
 # Providing safe fallbacks so the script compiles even if the DB isn't spun up yet.
 SQL_CFG = _CFG.get("azure_sql", {})
@@ -23,14 +21,8 @@ JDBC_URL = f"jdbc:sqlserver://{SQL_SERVER}:1433;database={SQL_DB};encrypt=true;t
 
 # COMMAND ----------
 
-TABLES_TO_PUBLISH = [
-    "dim_customer",
-    "dim_product",
-    "dim_date",
-    "fact_sales",
-    "agg_daily_sales_by_store",
-    "agg_sales_by_category"
-]
+TABLES_TO_PUBLISH = SQL_CFG.get("tables_to_publish", [])
+print(TABLES_TO_PUBLISH)
 
 # COMMAND ----------
 
